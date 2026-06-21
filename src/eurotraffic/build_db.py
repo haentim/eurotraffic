@@ -25,18 +25,27 @@ import numpy as np
 import polars as pl
 
 from . import DB_PATH
-from .class_curves import curve_for, derive_class_curves
-from .diurnal import DIURNAL_WEIGHTS
-from .features import CATEGORICAL_COLS, DEFAULT_CLASS_RANK, FEATURE_COLS, ROAD_CLASS_RANK
+from .class_curves import derive_class_curves
+from .features import (
+    CATEGORICAL_COLS,
+    DEFAULT_CLASS_RANK,
+    FEATURE_COLS,
+    ROAD_CLASS_RANK,
+    standardize_coords,
+)
 from .model import MODEL_PATH
 from .network import fetch_edges
-from .regularize import regularize_aadt
+from .regularize import N_HOURS, regularize_hourly
 from .registry import CityContext, discover_cities
 
-# Graph-regularization knobs: smoothing strength, and how strongly measured-anchored
-# streets resist being smoothed away from their measured value.
-REG_LAMBDA = 1.0
-MEASURED_WEIGHT = 80.0
+# Per-hour flow-consistency regularization knobs.
+REG_MU_FLOW = 0.2     # strictness of the "no dominating edge" flow constraint
+REG_MU_TIME = 0.5     # temporal smoothness of the per-hour correction
+MEASURED_WEIGHT = 80.0  # how strongly sensor-anchored streets resist being moved
+# Capacity fallback per road class (lanes, maxspeed km/h) when OSM tags are missing.
+_CAP_FALLBACK_LANES = 1.5
+_CAP_FALLBACK_SPEED = 50.0
+HOUR_COLS = [f"h{h}" for h in range(N_HOURS)]
 
 
 def _load_model():
@@ -67,13 +76,30 @@ def _predict(model, edges: pl.DataFrame, country: str) -> np.ndarray:
     pdf = edges.select("osm_type", "lanes", "maxspeed", "oneway",
                        "latitude", "longitude").to_pandas()
     pdf["country"] = country
+    # Per-city standardized coordinates, matching the training-time transform.
+    pdf["x_norm"], pdf["y_norm"] = standardize_coords(pdf["longitude"], pdf["latitude"])
     X = pdf[FEATURE_COLS]
     for c in CATEGORICAL_COLS:
         X[c] = X[c].astype("category")
     return np.expm1(model.predict(X))
 
 
-def _score_city(ctx: CityContext, model) -> pl.DataFrame:
+def _capacity(edges: pl.DataFrame) -> np.ndarray:
+    """Per-edge capacity proxy ``lanes × maxspeed`` (km/h), with class-median then
+    constant fallback where OSM tags are missing."""
+    e = edges.with_columns(
+        pl.col("lanes").fill_null(pl.col("lanes").median().over("osm_type")),
+        pl.col("maxspeed").fill_null(pl.col("maxspeed").median().over("osm_type")),
+    ).with_columns(
+        pl.col("lanes").fill_null(_CAP_FALLBACK_LANES),
+        pl.col("maxspeed").fill_null(_CAP_FALLBACK_SPEED),
+    )
+    cap = (e["lanes"] * e["maxspeed"]).to_numpy()
+    fallback = _CAP_FALLBACK_LANES * _CAP_FALLBACK_SPEED
+    return np.where(np.isfinite(cap) & (cap > 0), cap, fallback)
+
+
+def _score_city(ctx: CityContext, model, curves: dict) -> pl.DataFrame:
     edges = fetch_edges(ctx)
     pred = _predict(model, edges, ctx.country)
 
@@ -102,26 +128,31 @@ def _score_city(ctx: CityContext, model) -> pl.DataFrame:
         pred_mask = source == "predicted"
         aadt[pred_mask] = np.expm1(np.log1p(aadt[pred_mask]) + offset)
 
-    # Graph regularization: smooth estimates along connected same-class segments.
-    # Measured anchors get a high data weight so they barely move; predicted streets
-    # are pulled toward their neighbours (small inconsistencies remain by design).
-    weights = np.where(source == "measured", MEASURED_WEIGHT, 1.0)
-    aadt = regularize_aadt(
-        aadt, weights, edges["geometry"].to_list(),
-        groups=edges["osm_type"].to_list(), lam=REG_LAMBDA,
+    # Per-hour flow-consistency regularization. Starts from the prior per-hour field
+    # (daily volume × class diurnal curve), enforces "no dominating edge" at each
+    # vertex/hour, keeps sensor anchors pinned, lets high-capacity roads adjust more,
+    # and keeps the hourly correction temporally smooth. Returns C[n, 24].
+    C = regularize_hourly(
+        aadt, edges["geometry"].to_list(), edges["osm_type"].to_list(), curves,
+        capacity=_capacity(edges), measured=(source == "measured"),
+        mu_flow=REG_MU_FLOW, mu_time=REG_MU_TIME, measured_weight=MEASURED_WEIGHT,
     )
+    daily = C.sum(axis=1)  # regularized daily total (for ranking / size selection)
+    hour_cols = [pl.Series(HOUR_COLS[h], np.rint(C[:, h]).astype(np.int64)) for h in range(N_HOURS)]
 
     return edges.with_columns(
         pl.lit(ctx.city).alias("city"),
         pl.lit(ctx.country).alias("country"),
-        pl.Series("aadt", aadt, dtype=pl.Float64),
+        pl.Series("aadt", daily, dtype=pl.Float64),
         pl.Series("source", source.tolist(), dtype=pl.Utf8),
         pl.col("osm_type")
         .replace_strict(ROAD_CLASS_RANK, default=DEFAULT_CLASS_RANK, return_dtype=pl.Int64)
         .alias("class_rank"),
+        *hour_cols,
     ).select(
         "street_id", "city", "country", "osm_type", "class_rank", "lanes", "maxspeed",
         "oneway", "length_m", "aadt", "source", "longitude", "latitude", "geometry",
+        *HOUR_COLS,
     )
 
 
@@ -135,7 +166,7 @@ def build(buffer_km: float | None = None) -> None:
     city_rows: list[dict] = []
     for ctx in discover_cities():
         try:
-            streets = _score_city(ctx, model)
+            streets = _score_city(ctx, model, curves)
         except Exception as exc:  # noqa: BLE001 - keep building other cities
             print(f"  x {ctx.city}: FAILED ({exc})", file=sys.stderr)
             traceback.print_exc()
@@ -156,59 +187,53 @@ def build(buffer_km: float | None = None) -> None:
 
     streets = pl.concat(frames, how="vertical")
     cities = pl.DataFrame(city_rows).sort("city")
-    classes = sorted(set(streets["osm_type"].drop_nulls().unique().to_list()))
-    ceilings = compute_class_ceilings(streets, curves)
-    _write_sqlite(streets, cities, classes, curves, ceilings)
+    ceilings = compute_class_ceilings(streets)
+    _write_sqlite(streets, cities, ceilings)
     print(f"\nWrote {streets.height:,} streets for {cities.height} cities to {DB_PATH}")
 
 
-def compute_class_ceilings(streets: pl.DataFrame, curves: dict[str, list[float]]) -> list[tuple]:
+def compute_class_ceilings(streets: pl.DataFrame) -> list[tuple]:
     """Per-(city, road class) color ceiling so the scale is relative to street size.
 
-    Ceiling = p95 of the class's AADT (robust to mis-predicted outliers) × the
-    class's peak diurnal weight. Hour-independent, so the busiest street in a class
-    only reaches the ceiling at its peak hour — the time slider still varies colors,
-    but small streets light up at their own (lower) volumes instead of staying blue
-    under the city's motorway maximum.
+    Now that the per-hour field is stored directly, the ceiling is the p95 (robust to
+    outliers) of each class's *peak-hour* density. Hour-independent, so the slider
+    still varies colors while small streets light up at their own (lower) volumes.
     """
-    default_peak = max(DIURNAL_WEIGHTS)
-
-    def peak(osm_type) -> float:
-        return max(curve_for(osm_type, curves)) if osm_type is not None else default_peak
-
-    grouped = streets.group_by(["city", "osm_type"]).agg(
-        pl.col("aadt").quantile(0.95).alias("p95")
+    peak_expr = pl.max_horizontal(HOUR_COLS).alias("peak")
+    grouped = (
+        streets.with_columns(peak_expr)
+        .group_by(["city", "osm_type"])
+        .agg(pl.col("peak").quantile(0.95).alias("p95"))
     )
-    rows = []
-    for r in grouped.iter_rows(named=True):
-        ceil = max((r["p95"] or 1.0) * peak(r["osm_type"]), 1e-6)
-        rows.append((r["city"], r["osm_type"], float(ceil)))
-    return rows
+    return [
+        (r["city"], r["osm_type"], max(float(r["p95"] or 1.0), 1e-6))
+        for r in grouped.iter_rows(named=True)
+    ]
 
 
-def _class_diurnal_rows(classes: list[str], curves: dict[str, list[float]]) -> list[tuple]:
-    rows = []
-    for cls in [*classes, "_default"]:
-        weights = DIURNAL_WEIGHTS if cls == "_default" else curve_for(cls, curves)
-        rows.extend((cls, h, float(w)) for h, w in enumerate(weights))
-    return rows
-
-
-def _write_sqlite(streets, cities, classes, curves, ceilings) -> None:
+def _write_sqlite(streets, cities, ceilings) -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     if DB_PATH.exists():
         DB_PATH.unlink()
+    hour_cols_sql = ", ".join(f"{c} INTEGER" for c in HOUR_COLS)
+    base_cols = [
+        "street_id", "city", "country", "osm_type", "class_rank", "lanes",
+        "maxspeed", "oneway", "length_m", "aadt", "source",
+        "longitude", "latitude", "geometry",
+    ]
+    all_cols = base_cols + HOUR_COLS
+    placeholders = ",".join(["?"] * len(all_cols))
     con = sqlite3.connect(DB_PATH)
     try:
         con.executescript(
-            """
+            f"""
             CREATE TABLE streets (
                 street_id TEXT, city TEXT, country TEXT, osm_type TEXT,
                 class_rank INTEGER, lanes REAL, maxspeed REAL, oneway REAL,
                 length_m REAL, aadt REAL, source TEXT,
-                longitude REAL, latitude REAL, geometry TEXT
+                longitude REAL, latitude REAL, geometry TEXT,
+                {hour_cols_sql}
             );
-            CREATE TABLE class_diurnal (osm_type TEXT, hour INTEGER, weight REAL);
             CREATE TABLE class_ceiling (city TEXT, osm_type TEXT, ceiling REAL);
             CREATE TABLE cities (
                 city TEXT PRIMARY KEY, country TEXT,
@@ -218,16 +243,8 @@ def _write_sqlite(streets, cities, classes, curves, ceilings) -> None:
             """
         )
         con.executemany(
-            "INSERT INTO streets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            streets.select(
-                "street_id", "city", "country", "osm_type", "class_rank", "lanes",
-                "maxspeed", "oneway", "length_m", "aadt", "source",
-                "longitude", "latitude", "geometry",
-            ).rows(),
-        )
-        con.executemany(
-            "INSERT INTO class_diurnal VALUES (?,?,?)",
-            _class_diurnal_rows(classes, curves),
+            f"INSERT INTO streets VALUES ({placeholders})",
+            streets.select(all_cols).rows(),
         )
         con.executemany("INSERT INTO class_ceiling VALUES (?,?,?)", ceilings)
         con.executemany(

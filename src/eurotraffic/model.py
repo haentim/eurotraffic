@@ -22,7 +22,7 @@ from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import GroupKFold, KFold
 
 from . import DATASET_ROOT, PROJECT_ROOT
-from .features import CATEGORICAL_COLS, FEATURE_COLS, feature_record
+from .features import CATEGORICAL_COLS, FEATURE_COLS, feature_record, standardize_coords
 
 MODEL_PATH = PROJECT_ROOT / "data" / "model.joblib"
 
@@ -69,6 +69,13 @@ def _iter_training_rows():
 
 def build_training_frame() -> pd.DataFrame:
     df = pd.DataFrame(_iter_training_rows())
+    # Per-city standardized coordinates (relative position within each city).
+    parts = []
+    for _, g in df.groupby("city", sort=False):
+        g = g.copy()
+        g["x_norm"], g["y_norm"] = standardize_coords(g["longitude"], g["latitude"])
+        parts.append(g)
+    df = pd.concat(parts, ignore_index=True)
     for col in CATEGORICAL_COLS:
         df[col] = df[col].astype("category")
     return df

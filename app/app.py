@@ -1,8 +1,8 @@
 """EuroTraffic dashboard — pick a city, scrub the hour, see per-street traffic density.
 
-The drivable street network is colored by estimated density. Each street has a base
-AADT (measured where a sensor coincides, else predicted by a gradient-boosted model
-from OSM road features) and an hourly shape `density = aadt × class_diurnal[type, hour]`.
+The drivable street network is colored by estimated density. Each street stores a
+regularized per-hour density (24 values, column `hH`): predicted from OSM road
+features, anchored to measured sensors, then made flow-consistent across the network.
 
 Display logic: all streets in the current map frame are drawn; when a frame holds
 too many, only the largest are kept — ranked by road-class size, ties broken by daily
@@ -70,37 +70,28 @@ def load_class_ceiling() -> dict[tuple[str, str | None], float]:
     """Per-(city, road class) color ceiling, so the scale is *relative to street
     size*: a small street near its class's busy end is highlighted just like a
     motorway near its own — instead of staying blue under the city's motorway max.
-    Ceilings are hour-independent (p95 AADT × class peak weight), so the time slider
-    still varies colors. Built by ``build_db.compute_class_ceilings``."""
+    Ceilings are hour-independent (p95 of each class's peak-hour density), so the time
+    slider still varies colors. Built by ``build_db.compute_class_ceilings``."""
     rows = _CON.execute("SELECT city, osm_type, ceiling FROM class_ceiling").fetchall()
     return {(r[0], r[1]): (r[2] or 1.0) for r in rows}
 
 
-# Largest streets in a frame: index walk by (class_rank, aadt) with a bbox filter,
-# then the hourly class weight is applied to the capped set. See idx_streets_rank.
-_FRAME_SQL = """
-SELECT s.geometry, s.source, s.osm_type, s.aadt,
-       s.aadt * COALESCE(cd.weight, dd.weight) AS density
-FROM (
-    SELECT geometry, source, osm_type, aadt, class_rank
-    FROM streets
-    WHERE city = :city
-      AND longitude BETWEEN :w AND :e
-      AND latitude  BETWEEN :s AND :n
-    ORDER BY class_rank ASC, aadt DESC
-    LIMIT :cap
-) s
-LEFT JOIN class_diurnal cd ON cd.osm_type = s.osm_type AND cd.hour = :h
-LEFT JOIN class_diurnal dd ON dd.osm_type = '_default'  AND dd.hour = :h
-ORDER BY s.class_rank ASC, s.aadt DESC
-"""
-
-
+# Largest streets in a frame: index walk by (class_rank, aadt) with a bbox filter.
+# The per-hour density is stored directly (regularized field), read from column hH.
 def load_in_frame(city, hour, bbox) -> list[dict]:
     w, s, e, n = bbox
+    hcol = f"h{int(hour)}"  # int 0..23, safe to interpolate
+    sql = f"""
+        SELECT geometry, source, osm_type, {hcol} AS density
+        FROM streets
+        WHERE city = :city
+          AND longitude BETWEEN :w AND :e
+          AND latitude  BETWEEN :s AND :n
+        ORDER BY class_rank ASC, aadt DESC
+        LIMIT :cap
+    """
     rows = _CON.execute(
-        _FRAME_SQL,
-        {"city": city, "w": w, "e": e, "s": s, "n": n, "h": hour, "cap": MAX_FEATURES},
+        sql, {"city": city, "w": w, "e": e, "s": s, "n": n, "cap": MAX_FEATURES}
     ).fetchall()
     return [dict(r) for r in rows]
 

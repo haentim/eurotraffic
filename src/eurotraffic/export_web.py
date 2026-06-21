@@ -20,6 +20,7 @@ import time
 import shapely
 
 from . import DB_PATH, PROJECT_ROOT
+from .regularize import N_HOURS
 
 WEB_DATA = PROJECT_ROOT / "web" / "data"
 SIMPLIFY_TOL = 0.00005  # ~5 m in degrees
@@ -37,21 +38,24 @@ def _simplify_wkt(wkts: list[str]) -> list[str]:
     return list(shapely.to_wkt(geoms, rounding_precision=WKT_PRECISION))
 
 
-def _city_db_bytes(rows, diurnal, ceiling) -> bytes:
+HOUR_COLS = [f"h{h}" for h in range(N_HOURS)]
+
+
+def _city_db_bytes(rows, ceiling) -> bytes:
     """Build a self-contained in-memory SQLite for one city and serialize it."""
+    hour_decl = ", ".join(f"{c} INTEGER" for c in HOUR_COLS)
+    n_cols = 7 + N_HOURS
     mem = sqlite3.connect(":memory:")
     mem.executescript(
-        """
+        f"""
         CREATE TABLE streets (
             osm_type TEXT, class_rank INTEGER, aadt INTEGER, source INTEGER,
-            longitude REAL, latitude REAL, geometry TEXT
+            longitude REAL, latitude REAL, geometry TEXT, {hour_decl}
         );
-        CREATE TABLE class_diurnal (osm_type TEXT, hour INTEGER, weight REAL);
         CREATE TABLE class_ceiling (osm_type TEXT, ceiling REAL);
         """
     )
-    mem.executemany("INSERT INTO streets VALUES (?,?,?,?,?,?,?)", rows)
-    mem.executemany("INSERT INTO class_diurnal VALUES (?,?,?)", diurnal)
+    mem.executemany(f"INSERT INTO streets VALUES ({','.join(['?'] * n_cols)})", rows)
     mem.executemany("INSERT INTO class_ceiling VALUES (?,?)", ceiling)
     mem.execute("CREATE INDEX idx_rank ON streets (class_rank, aadt DESC)")
     mem.commit()
@@ -67,15 +71,14 @@ def export() -> None:
         "SELECT city, country, center_lat, center_lon, n_streets, n_measured, model_r2 "
         "FROM cities ORDER BY city"
     ).fetchall()
-    diurnal = src.execute("SELECT osm_type, hour, weight FROM class_diurnal").fetchall()
-
     manifest = []
     print(f"Exporting {len(cities)} cities to {WEB_DATA} ...")
     t0 = time.time()
+    hour_sel = ", ".join(HOUR_COLS)
     for city, country, clat, clon, n_streets, n_measured, r2 in cities:
         raw = src.execute(
-            "SELECT osm_type, class_rank, aadt, source, longitude, latitude, geometry "
-            "FROM streets WHERE city = ?",
+            f"SELECT osm_type, class_rank, aadt, source, longitude, latitude, geometry, "
+            f"{hour_sel} FROM streets WHERE city = ?",
             (city,),
         ).fetchall()
         if not raw:
@@ -88,6 +91,7 @@ def export() -> None:
                 int(round(r[2] or 0)),
                 1 if r[3] == "measured" else 0,
                 r[4], r[5], w,
+                *[int(r[7 + h] or 0) for h in range(N_HOURS)],
             )
             for r, w in zip(raw, wkts)
         ]
@@ -98,7 +102,7 @@ def export() -> None:
             "SELECT osm_type, ceiling FROM class_ceiling WHERE city = ?", (city,)
         ).fetchall()
 
-        blob = gzip.compress(_city_db_bytes(rows, diurnal, ceiling), GZIP_LEVEL)
+        blob = gzip.compress(_city_db_bytes(rows, ceiling), GZIP_LEVEL)
         fname = f"{slug(city)}.sqlite.gz"
         (WEB_DATA / fname).write_bytes(blob)
         manifest.append({

@@ -30,18 +30,14 @@ MAX_FEATURES = 1500
 COLORS = ["#2c7bb6", "#abd9e9", "#ffff8c", "#fdae61", "#d7191c"]
 NORM_CMAP = cm.LinearColormap(COLORS, vmin=0, vmax=1)
 
-_FRAME_SQL = """
-SELECT s.geometry, s.source, s.osm_type, s.aadt,
-       s.aadt * COALESCE(cd.weight, dd.weight) AS density
-FROM (
-    SELECT geometry, source, osm_type, aadt, class_rank FROM streets
-    WHERE longitude BETWEEN :w AND :e AND latitude BETWEEN :s AND :n
-    ORDER BY class_rank ASC, aadt DESC LIMIT :cap
-) s
-LEFT JOIN class_diurnal cd ON cd.osm_type = s.osm_type AND cd.hour = :h
-LEFT JOIN class_diurnal dd ON dd.osm_type = '_default'  AND dd.hour = :h
-ORDER BY s.class_rank ASC, s.aadt DESC
-"""
+# Per-hour density is stored directly (regularized field) in column hH.
+def _frame_sql(hour: int) -> str:
+    return f"""
+        SELECT geometry, source, osm_type, h{int(hour)} AS density
+        FROM streets
+        WHERE longitude BETWEEN :w AND :e AND latitude BETWEEN :s AND :n
+        ORDER BY class_rank ASC, aadt DESC LIMIT :cap
+    """
 
 
 _BASE: str | None = None
@@ -138,11 +134,11 @@ def _line_coords(wkt: str) -> list[list[float]]:
 def _features(con, ceilings, hour: int, bbox) -> dict:
     w, s, e, n = bbox
     rows = con.execute(
-        _FRAME_SQL,
-        {"w": w, "e": e, "s": s, "n": n, "h": hour, "cap": MAX_FEATURES},
+        _frame_sql(hour),
+        {"w": w, "e": e, "s": s, "n": n, "cap": MAX_FEATURES},
     ).fetchall()
     feats = []
-    for geometry, source, osm_type, aadt, density in rows:
+    for geometry, source, osm_type, density in rows:
         if not geometry:
             continue
         density = density or 0.0

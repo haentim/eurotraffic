@@ -13,8 +13,26 @@ from __future__ import annotations
 
 import re
 
-# Model feature columns. ``osm_type`` and ``country`` are categorical.
-FEATURE_COLS = ["osm_type", "country", "lanes", "maxspeed", "oneway", "latitude", "longitude"]
+import numpy as np
+
+
+def standardize_coords(lon, lat) -> tuple[np.ndarray, np.ndarray]:
+    """Per-population z-score of coordinates → (x_norm, y_norm), mean 0 / std 1.
+
+    Applied per city (treated points at train time, network edges at inference) so the
+    model sees *relative position within the city*. Guards a zero/degenerate spread.
+    """
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    sx = lon.std() or 1.0
+    sy = lat.std() or 1.0
+    return (lon - lon.mean()) / sx, (lat - lat.mean()) / sy
+
+# Model feature columns. ``osm_type`` and ``country`` are categorical. ``x_norm`` and
+# ``y_norm`` are per-city standardized coordinates (see ``standardize_coords``) — i.e.
+# relative position within a city rather than absolute geography, which transfers better
+# across cities than raw lat/lon.
+FEATURE_COLS = ["osm_type", "country", "lanes", "maxspeed", "oneway", "x_norm", "y_norm"]
 CATEGORICAL_COLS = ["osm_type", "country"]
 TARGET = "aadt"
 
