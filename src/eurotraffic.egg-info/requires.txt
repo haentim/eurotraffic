@@ -1,0 +1,10 @@
+shiny
+polars
+folium
+branca
+shapely
+pyproj
+geopandas
+pyogrio
+openpyxl
+pyarrow

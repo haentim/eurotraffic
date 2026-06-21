@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.shiny/
+
+# Source dataset — cloned separately via scripts/fetch_data_repo.sh
+traffic-volume-data-EU-cities/
+
+# Local preprocessing artifacts (regenerable; too large to track)
+/data/
+/cache/
+
+# Standalone web app build output (built in CI from web/data/)
+site/
+web/app/cities.json
+
+# NOTE: web/data/*.sqlite.gz (the slim per-city files, ~76 MB) ARE committed —
+# GitHub Pages serves them and the CI build copies them into site/data.

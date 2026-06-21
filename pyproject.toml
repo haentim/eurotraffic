@@ -1,0 +1,33 @@
+[project]
+name = "eurotraffic"
+version = "0.1.0"
+description = "Shiny dashboard of harmonized European city traffic density by time of day"
+requires-python = ">=3.12"
+dependencies = [
+    "shiny",
+    "polars",
+    "folium",
+    "branca",
+    "shapely",
+    "pyproj",
+    "geopandas",
+    "pyogrio",
+    "openpyxl",
+    "pyarrow",
+    "osmnx==2.0.1",
+    "scikit-learn",
+    "joblib",
+    "shinywidgets",
+    "ipyleaflet",
+]
+
+[project.optional-dependencies]
+# Build the standalone Pyodide/Shinylive site (scripts/build_web.sh).
+web = ["shinylive"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
