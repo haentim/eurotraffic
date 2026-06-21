@@ -36,7 +36,8 @@ else
 fi
 
 echo "==> shinylive export -> site/"
-"$SHINYLIVE" export web/app site
+"$SHINYLIVE" export web/app site \
+  --template-params '{"title": "EuroTraffic — European traffic density by time of day"}'
 
 if [ "$DATA_BASE" = "local" ]; then
   echo "==> Copying per-city data into site/data"

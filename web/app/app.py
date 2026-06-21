@@ -176,6 +176,11 @@ app_ui = ui.page_sidebar(
         ui.output_ui("legend"),
         ui.output_text("status"),
         ui.output_ui("hover_info"),
+        ui.p(
+            "Tip: zoom in to reveal smaller roads — only the largest streets are "
+            "shown when the view is too crowded.",
+            style="font-size:0.8em; color:#777; margin-top:0.4em",
+        ),
         width=340,
     ),
     output_widget("map"),
