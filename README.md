@@ -1,8 +1,9 @@
-# EuroTraffic
+# EuroTraffic (Vibe Coding Project)
 
 Interactive Shiny-for-Python dashboard of traffic density across European cities,
 built on the *Harmonized Annual Averaged Traffic Data at Street Segment Level for
-European Cities* dataset (`traffic-volume-data-EU-cities/`).
+European Cities* dataset by Xavier Bonnemaizon et al.
+([XavB64/traffic-volume-data-EU-cities](https://github.com/XavB64/traffic-volume-data-EU-cities)).
 
 Pick a city, scrub the **time-of-day slider**, and a Folium/Leaflet map colors the
 **whole drivable street network** by estimated traffic density for that hour.
@@ -58,11 +59,12 @@ python3 -m venv .venv
 
 ## Source data
 
-The upstream dataset is **not vendored** here. Clone it before running the
-preprocessing pipeline:
+The upstream dataset
+([XavB64/traffic-volume-data-EU-cities](https://github.com/XavB64/traffic-volume-data-EU-cities))
+is **not vendored** here. Clone it before running the preprocessing pipeline:
 
 ```bash
-scripts/fetch_data_repo.sh   # clones github.com/XavB64/traffic-volume-data-EU-cities
+scripts/fetch_data_repo.sh   # clones the dataset into traffic-volume-data-EU-cities/
 ```
 
 ## Build the database
