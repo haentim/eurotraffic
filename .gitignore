@@ -17,6 +17,7 @@ web/app/cities.json
 # Working notes — local only, not tracked
 SESSION_HANDOFF.md
 WEB_APP_PLAN.md
+DENSITY_MODEL_MATH.md
 
 # NOTE: web/data/*.sqlite.gz (the slim per-city files, ~76 MB) ARE committed —
 # GitHub Pages serves them and the CI build copies them into site/data.
